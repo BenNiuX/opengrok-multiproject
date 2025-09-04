@@ -128,27 +128,33 @@ The first reindex will take some time to finish. Subsequent reindex will be incr
 [Docker-compose](https://docs.docker.com/compose/install/) example:
 
 ```yaml
-version: "3"
-
 # More info at https://github.com/oracle/opengrok/docker/
 services:
   opengrok:
     container_name: opengrok
-    image: opengrok/docker:latest
+    image: niubenxy/opengrok:latest
     ports:
       - "8080:8080/tcp"
     environment:
-      SYNC_PERIOD_MINUTES: '60'
+      SYNC_PERIOD_MINUTES: '0' # Disable periodic sync
+      # Disable history, SCM, Ignore
+      INDEXER_OPT: "--historyBased off --remote off --disableRepository git --disableRepository Perforce --disableRepository repo --progress --quiet --ignore d:out* --ignore d:bazel-bin --ignore d:.git"
+      INDEXER_JAVA_OPTS: "-Xmx1g"
+      NOMIRROR: "nomirror"
+      REST_TOKEN: "<YOUR_TOKEN>" # Token used to trigger project index
+      # Run cmd in the docker: curl -X GET -H "Authorization: Bearer <YOUR_TOKEN>" "http://localhost:5000/reindex?project=<PROJECT_NAME>"
     # Volumes store your data between container upgrades
     volumes:
-       - '~/opengrok/src/:/opengrok/src/'  # source code
-       - '~/opengrok/etc/:/opengrok/etc/'  # folder contains configuration.xml
-       - '~/opengrok/data/:/opengrok/data/'  # index and other things for source code
+       # workspace -> workspace must be the same because we use relative link in projects folder
+       # test_projects need at the same folder as workspace
+       - '~/opengrok/workspace/:/opengrok/workspace/'
+       - '~/opengrok/test_projects/:/opengrok/projects/'
+       - '~/opengrok/test_projects_data/:/opengrok/projects_data/'
 ```
 
 Save the file into `docker-compose.yml` and then simply run
 
-    docker-compose up -d
+    docker compose up -d
 
 Equivalent `docker run` command would look like this:
 
@@ -156,11 +162,11 @@ Equivalent `docker run` command would look like this:
 docker run -d \
     --name opengrok \
     -p 8080:8080/tcp \
-    -e SYNC_PERIOD_MINUTES="60" \
-    -v ~/opengrok-src/:/opengrok/src/ \
-    -v ~/opengrok-etc/:/opengrok/etc/ \
-    -v ~/opengrok-data/:/opengrok/data/ \
-    opengrok/docker:latest
+    -e SYNC_PERIOD_MINUTES="0" \
+    -v ~/opengrok/workspace/:/opengrok/workspace/ \
+    -v ~/opengrok/test_projects/:/opengrok/projects/ \
+    -v ~/opengrok/test_projects_data/:/opengrok/projects_data/ \
+    niubenxy/opengrok:latest
 ```
 
 ## Build image locally

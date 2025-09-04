@@ -36,7 +36,7 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask
+from flask import Flask, request
 from flask_httpauth import HTTPTokenAuth
 from opengrok_tools.config_merge import merge_config_files
 from opengrok_tools.deploy import deploy_war
@@ -76,13 +76,26 @@ else:
     OPENGROK_BASE_DIR = os.path.join(fs_root, "opengrok")
 
 OPENGROK_LIB_DIR = os.path.join(OPENGROK_BASE_DIR, "lib")
-OPENGROK_DATA_ROOT = os.path.join(OPENGROK_BASE_DIR, "data")
-OPENGROK_SRC_ROOT = os.path.join(OPENGROK_BASE_DIR, "src")
-BODY_INCLUDE_FILE = os.path.join(OPENGROK_DATA_ROOT, "body_include")
-OPENGROK_CONFIG_DIR = os.path.join(OPENGROK_BASE_DIR, "etc")
-OPENGROK_CONFIG_FILE = os.path.join(OPENGROK_CONFIG_DIR, "configuration.xml")
+# OPENGROK_DATA_ROOT = os.path.join(OPENGROK_BASE_DIR, "data")
+# OPENGROK_SRC_ROOT = os.path.join(OPENGROK_BASE_DIR, "src")
+# BODY_INCLUDE_FILE = os.path.join(OPENGROK_DATA_ROOT, "body_include")
+# OPENGROK_CONFIG_DIR = os.path.join(OPENGROK_BASE_DIR, "etc")
+# OPENGROK_CONFIG_FILE = os.path.join(OPENGROK_CONFIG_DIR, "configuration.xml")
 OPENGROK_WEBAPPS_DIR = os.path.join(tomcat_root, "webapps")
 OPENGROK_JAR = os.path.join(OPENGROK_LIB_DIR, "opengrok.jar")
+
+# Multi-project support
+TOMCAT_ADDR = "http://localhost:8080/"
+OPENGROK_PROJECTS_DIR = os.path.join(OPENGROK_BASE_DIR, "projects")
+OPENGROK_PROJECTS_DATA_DIR = os.path.join(OPENGROK_BASE_DIR, "projects_data")
+# Define global variables, will be updated by each project in multi-project support
+opengrok_data_root = None
+opengrok_src_root = None
+opengrok_config_dir = None
+opengrok_config_file = None
+global_url_root = None
+global_uri = None
+global_index_project = None
 
 NOMIRROR_ENV_NAME = "NOMIRROR"
 API_TIMEOUT_ENV_NAME = "API_TIMEOUT"
@@ -115,6 +128,15 @@ def index():
     API endpoint for triggering reindex.
     :return: message describing the outcome
     """
+    # Run cmd in container:curl -X GET -H "Authorization: Bearer <YOUR_TOKEN>" \
+    #  "http://localhost:5000/reindex?project=PROJECT_NAME"
+    # Get the project name from the request
+    logger = logging.getLogger(__name__)
+    project_name = request.args.get('project')
+    if not project_name:
+        return "Reindex not triggered - the project is not specified\n"
+    logger.debug("Project name: {}".format(project_name))
+    set_global_variables(project_name)
     global periodic_timer  # noqa: F824
 
     if periodic_timer:
@@ -156,7 +178,7 @@ def set_url_root(logger, url_root):
     if url_root.endswith("/"):
         url_root = url_root[:-1]
 
-    uri = "http://localhost:8080/" + url_root
+    uri = TOMCAT_ADDR + url_root
     #
     # Make sure URI ends with slash. This is important for the various API
     # calls, notably for those that check the HTTP error code.
@@ -179,6 +201,42 @@ def get_war_name(url_root):
 
     return url_root + ".war"
 
+# Multi-project support, update global variables during handle each project
+def set_global_variables(project_name):
+    global opengrok_data_root
+    global opengrok_src_root
+    global opengrok_config_dir
+    global opengrok_config_file
+    global global_index_project
+    global global_url_root
+    global global_uri
+    project_root = os.path.join(OPENGROK_PROJECTS_DATA_DIR, project_name)
+    os.makedirs(project_root, exist_ok=True)
+    opengrok_data_root = os.path.join(project_root, "data")
+    os.makedirs(opengrok_data_root, exist_ok=True)
+    opengrok_src_root = os.path.join(OPENGROK_PROJECTS_DIR, project_name)
+    opengrok_config_dir = os.path.join(project_root, "etc")
+    os.makedirs(opengrok_config_dir, exist_ok=True)
+    opengrok_config_file = os.path.join(opengrok_config_dir, "configuration.xml")
+    global_index_project = project_name
+    global_url_root = project_name
+    global_uri = TOMCAT_ADDR + global_url_root + "/"
+
+def reset_global_variables():
+    global opengrok_data_root
+    global opengrok_src_root
+    global opengrok_config_dir
+    global opengrok_config_file
+    global global_index_project
+    global global_url_root
+    global global_uri
+    opengrok_data_root = None
+    opengrok_src_root = None
+    opengrok_config_dir = None
+    opengrok_config_file = None
+    global_index_project = None
+    global_url_root = None
+    global_uri = None
 
 def deploy(logger, url_root):
     """
@@ -197,12 +255,14 @@ def deploy(logger, url_root):
         if os.path.isdir(subdir):
             logger.debug("Removing '{}' directory recursively".format(subdir))
             shutil.rmtree(subdir)
-
+    war_name = get_war_name(url_root)
+    logger.debug("deploy war for url '{}', war name '{}' "
+                  "with config file '{}'".format(url_root, war_name, opengrok_config_file))
     deploy_war(
         logger,
         os.path.join(OPENGROK_LIB_DIR, "source.war"),
-        os.path.join(OPENGROK_WEBAPPS_DIR, get_war_name(url_root)),
-        OPENGROK_CONFIG_FILE,
+        os.path.join(OPENGROK_WEBAPPS_DIR, war_name),
+        opengrok_config_file,
         None,
     )
 
@@ -254,7 +314,7 @@ def refresh_projects(logger, uri, api_timeout):
         return
 
     logger.debug("Projects from the web app: {}".format(webapp_projects))
-    src_root = OPENGROK_SRC_ROOT
+    src_root = opengrok_src_root
 
     # Add projects for top-level directories under source root.
     for item in os.listdir(src_root):
@@ -327,19 +387,25 @@ def indexer_no_projects(logger, uri, config_path, extra_indexer_options):
     if indexer_java_opts:
         indexer_java_opts = indexer_java_opts.split()
 
-    wait_for_tomcat(logger, uri)
+    # wait_for_tomcat(logger, uri)
 
     while True:
+        # Waiting manual reindex signal
+        global periodic_timer  # noqa: F824
+        periodic_timer.wait_for_event()
+        uri = global_uri
+        config_path = opengrok_config_file
+        # wait_for_tomcat(logger, uri)
         indexer_options = [
             "-s",
-            OPENGROK_SRC_ROOT,
+            opengrok_src_root,
             "-d",
-            OPENGROK_DATA_ROOT,
+            opengrok_data_root,
             "-c",
             "/usr/local/bin/ctags",
-            "--remote",
-            "on",
-            "-H",
+            # "--remote",
+            # "on",
+            # "-H",
             "-W",
             config_path,
             "-U",
@@ -359,9 +425,11 @@ def indexer_no_projects(logger, uri, config_path, extra_indexer_options):
         )
         indexer.execute()
 
+        logger.info("index for no projects done for {}".format(uri))
+        reset_global_variables()
         logger.info("Waiting for reindex to be triggered")
-        global periodic_timer  # noqa: F824
-        periodic_timer.wait_for_event()
+        # global periodic_timer  # noqa: F824
+        # periodic_timer.wait_for_event()
 
 
 def project_syncer(logger, loglevel, uri, config_path, numworkers, env, api_timeout):
@@ -370,9 +438,15 @@ def project_syncer(logger, loglevel, uri, config_path, numworkers, env, api_time
     To be run in a thread/process in the background.
     """
 
-    wait_for_tomcat(logger, uri)
+    # wait_for_tomcat(logger, TOMCAT_ADDR)
 
     while True:
+        # Waiting manual reindex signal
+        global periodic_timer  # noqa: F824
+        periodic_timer.wait_for_event()
+        uri = global_uri
+        config_path = opengrok_config_file
+        # wait_for_tomcat(logger, uri)
         refresh_projects(logger, uri, api_timeout)
 
         if os.environ.get("OPENGROK_SYNC_YML"):  # debug only
@@ -415,13 +489,15 @@ def project_syncer(logger, loglevel, uri, config_path, numworkers, env, api_time
             logger.info("Sync done")
 
             # Workaround for https://github.com/oracle/opengrok/issues/1670
-            Path(os.path.join(OPENGROK_DATA_ROOT, "timestamp")).touch()
+            Path(os.path.join(opengrok_data_root, "timestamp")).touch()
 
             save_config(logger, uri, config_path, api_timeout)
+        logger.info("index for project syncer done for {}".format(uri))
+        reset_global_variables()
 
         logger.info("Waiting for reindex to be triggered")
-        global periodic_timer  # noqa: F824
-        periodic_timer.wait_for_event()
+        # global periodic_timer  # noqa: F824
+        # periodic_timer.wait_for_event()
 
 
 def create_bare_config(logger, use_projects, extra_indexer_options=None):
@@ -433,20 +509,21 @@ def create_bare_config(logger, use_projects, extra_indexer_options=None):
     if indexer_java_opts:
         indexer_java_opts = indexer_java_opts.split()
 
-    logger.info("Creating bare configuration in {}".format(OPENGROK_CONFIG_FILE))
+    logger.info("Creating bare configuration in {}".format(opengrok_config_file))
     indexer_options = [
         "-s",
-        OPENGROK_SRC_ROOT,
+        opengrok_src_root,
         "-d",
-        OPENGROK_DATA_ROOT,
+        opengrok_data_root,
         "-c",
         "/usr/local/bin/ctags",
-        "--remote",
-        "on",
-        "-H",
+        # "--remote",
+        # "on",
+        # "-H",
         "-S",
         "-W",
-        OPENGROK_CONFIG_FILE,
+        opengrok_config_file,
+        # No index when setup project. Reindex later by manual operation
         "--noIndex",
     ]
 
@@ -496,9 +573,9 @@ def check_index_and_wipe_out(logger):
         indexer_java_opts = indexer_java_opts.split()
 
     check_index = os.environ.get("CHECK_INDEX")
-    if check_index and os.path.exists(OPENGROK_CONFIG_FILE):
+    if check_index and os.path.exists(opengrok_config_file):
         logger.info("Checking if index matches current version")
-        indexer_options = ["-R", OPENGROK_CONFIG_FILE, "--checkIndex", "version"]
+        indexer_options = ["-R", opengrok_config_file, "--checkIndex", "version"]
         indexer = Indexer(
             indexer_options,
             java_opts=indexer_java_opts,
@@ -509,7 +586,7 @@ def check_index_and_wipe_out(logger):
         indexer.execute()
         if indexer.getretcode() == 1:
             logger.info("Wiping out data root")
-            root = OPENGROK_DATA_ROOT
+            root = opengrok_data_root
             for entry in os.listdir(root):
                 path = os.path.join(root, entry)
                 if os.path.isdir(path):
@@ -565,136 +642,147 @@ def main():
     else:
         logger.info("synchronization period = {} minutes".format(sync_period_mins))
 
-    # Note that deploy is done before Tomcat is started.
-    deploy(logger, url_root)
+    # Multi-project support, setup each project
+    for item in os.listdir(OPENGROK_PROJECTS_DIR):
+        # Check if the item is a file
+        if os.path.isfile(os.path.join(OPENGROK_PROJECTS_DIR, item)):
+            continue
+        set_global_variables(item)
+        uri, url_root = set_url_root(logger, item)
+        # Note that deploy is done before Tomcat is started.
+        deploy(logger, item)
 
-    if url_root != "source":
-        setup_redirect_source(logger, url_root)
+        if url_root != "source":
+            setup_redirect_source(logger, url_root)
 
-    api_timeout = 8
-    if os.environ.get(API_TIMEOUT_ENV_NAME):
-        api_timeout = int(os.environ.get(API_TIMEOUT_ENV_NAME))
-        logger.info(f"API timeout set to {api_timeout} seconds")
-    else:
-        os.environ[API_TIMEOUT_ENV_NAME] = str(api_timeout)
-
-    env = {}
-    extra_indexer_options = os.environ.get("INDEXER_OPT", "")
-    if extra_indexer_options:
-        logger.info("extra indexer options: '{}'".format(extra_indexer_options))
-        env["OPENGROK_INDEXER_OPTIONAL_ARGS"] = extra_indexer_options
-
-    if os.environ.get(NOMIRROR_ENV_NAME):
-        env[OPENGROK_NO_MIRROR_ENV] = os.environ.get(NOMIRROR_ENV_NAME)
-    logger.debug("Extra environment: {}".format(env))
-
-    use_projects = True
-    if os.environ.get("AVOID_PROJECTS"):
-        use_projects = False
-
-    #
-    # Create empty configuration to avoid the non-existent file exception
-    # in the web app during the first web app startup.
-    #
-    if (
-        not os.path.exists(OPENGROK_CONFIG_FILE)
-        or os.path.getsize(OPENGROK_CONFIG_FILE) == 0
-    ):
-        create_bare_config(logger, use_projects, extra_indexer_options.split())
-
-    #
-    # Index check needs read-only configuration, so it is called
-    # right after create_bare_config().
-    #
-    check_index_and_wipe_out(logger)
-
-    #
-    # If there is read-only configuration file, merge it with current
-    # configuration.
-    #
-    read_only_config_file = os.environ.get("READONLY_CONFIG_FILE")
-    if read_only_config_file and os.path.exists(read_only_config_file):
-        logger.info(
-            "Merging read-only configuration from '{}' with current "
-            "configuration in '{}'".format(read_only_config_file, OPENGROK_CONFIG_FILE)
-        )
-        out_file_path = None
-        with tempfile.NamedTemporaryFile(
-            mode="w+", delete=False, prefix="merged_config"
-        ) as tmp_out_fobj:
-            out_file_path = tmp_out_fobj.name
-            merge_config_files(
-                read_only_config_file,
-                OPENGROK_CONFIG_FILE,
-                out_file_path,
-                jar=OPENGROK_JAR,
-                loglevel=log_level,
-            )
-
-        if out_file_path and os.path.getsize(out_file_path) > 0:
-            shutil.move(out_file_path, OPENGROK_CONFIG_FILE)
+        api_timeout = 8
+        if os.environ.get(API_TIMEOUT_ENV_NAME):
+            api_timeout = int(os.environ.get(API_TIMEOUT_ENV_NAME))
+            logger.info(f"API timeout set to {api_timeout} seconds")
         else:
-            logger.warning(
-                "Failed to merge read-only configuration, "
-                "leaving the original in place"
+            os.environ[API_TIMEOUT_ENV_NAME] = str(api_timeout)
+
+        env = {}
+        extra_indexer_options = os.environ.get("INDEXER_OPT", "")
+        if extra_indexer_options:
+            logger.info("extra indexer options: '{}'".format(extra_indexer_options))
+            env["OPENGROK_INDEXER_OPTIONAL_ARGS"] = extra_indexer_options
+
+        if os.environ.get(NOMIRROR_ENV_NAME):
+            env[OPENGROK_NO_MIRROR_ENV] = os.environ.get(NOMIRROR_ENV_NAME)
+        logger.debug("Extra environment: {}".format(env))
+
+        use_projects = True
+        if os.environ.get("AVOID_PROJECTS"):
+            use_projects = False
+
+        #
+        # Create empty configuration to avoid the non-existent file exception
+        # in the web app during the first web app startup.
+        #
+        if (
+            not os.path.exists(opengrok_config_file)
+            or os.path.getsize(opengrok_config_file) == 0
+        ):
+            create_bare_config(logger, use_projects, extra_indexer_options.split())
+
+        #
+        # Index check needs read-only configuration, so it is called
+        # right after create_bare_config().
+        #
+        # Add a environment variable to enable index check and wipe out
+        if os.environ.get("CHECK_INDEX_AND_WIPE_OUT"):
+            check_index_and_wipe_out(logger)
+
+        #
+        # If there is read-only configuration file, merge it with current
+        # configuration.
+        #
+        read_only_config_file = os.environ.get("READONLY_CONFIG_FILE")
+        if read_only_config_file and os.path.exists(read_only_config_file):
+            logger.info(
+                "Merging read-only configuration from '{}' with current "
+                "configuration in '{}'".format(read_only_config_file, opengrok_config_file)
             )
-            if out_file_path:
-                os.remove(out_file_path)
-
-    sync_enabled = True
-    if use_projects:
-        mirror_config = os.path.join(OPENGROK_CONFIG_DIR, "mirror.yml")
-        if not os.path.exists(mirror_config):
-            with open(mirror_config, "w") as fp:
-                fp.write("# Empty config file for opengrok-mirror\n")
-
-        num_workers = get_num_from_env(logger, "WORKERS", multiprocessing.cpu_count())
-        logger.info("Number of sync workers: {}".format(num_workers))
-
-        if not os.environ.get(NOMIRROR_ENV_NAME):
-            conf = read_config(logger, mirror_config)
-            logger.info("Checking mirror configuration in '{}'".format(mirror_config))
-            if not check_configuration(conf):
-                logger.error(
-                    "Mirror configuration in '{}' is invalid, "
-                    "disabling sync".format(mirror_config)
+            out_file_path = None
+            with tempfile.NamedTemporaryFile(
+                mode="w+", delete=False, prefix="merged_config"
+            ) as tmp_out_fobj:
+                out_file_path = tmp_out_fobj.name
+                merge_config_files(
+                    read_only_config_file,
+                    opengrok_config_file,
+                    out_file_path,
+                    jar=OPENGROK_JAR,
+                    loglevel=log_level,
                 )
-                sync_enabled = False
 
-        worker_function = project_syncer
-        syncer_args = (
-            logger,
-            log_level,
-            uri,
-            OPENGROK_CONFIG_FILE,
-            num_workers,
-            env,
-            api_timeout,
-        )
-    else:
-        worker_function = indexer_no_projects
-        syncer_args = (logger, uri, OPENGROK_CONFIG_FILE, extra_indexer_options)
+            if out_file_path and os.path.getsize(out_file_path) > 0:
+                shutil.move(out_file_path, opengrok_config_file)
+            else:
+                logger.warning(
+                    "Failed to merge read-only configuration, "
+                    "leaving the original in place"
+                )
+                if out_file_path:
+                    os.remove(out_file_path)
+        sync_enabled = True
+        if use_projects:
+            mirror_config = os.path.join(opengrok_config_dir, "mirror.yml")
+            if not os.path.exists(mirror_config):
+                with open(mirror_config, "w") as fp:
+                    fp.write("# Empty config file for opengrok-mirror\n")
 
-    if sync_enabled:
-        period_seconds = sync_period_mins * 60
-        logger.debug(
-            f"Creating and starting periodic timer (period {period_seconds} seconds)"
-        )
-        global periodic_timer
-        periodic_timer = PeriodicTimer(period_seconds)
-        periodic_timer.start()
+            num_workers = get_num_from_env(logger, "WORKERS", multiprocessing.cpu_count())
+            logger.info("Number of sync workers: {}".format(num_workers))
 
-        logger.debug("Starting sync thread")
-        sync_thread = threading.Thread(
-            target=worker_function, name="Sync thread", args=syncer_args, daemon=True
-        )
-        sync_thread.start()
+            if not os.environ.get(NOMIRROR_ENV_NAME):
+                conf = read_config(logger, mirror_config)
+                logger.info("Checking mirror configuration in '{}'".format(mirror_config))
+                if not check_configuration(conf):
+                    logger.error(
+                        "Mirror configuration in '{}' is invalid, "
+                        "disabling sync".format(mirror_config)
+                    )
+                    sync_enabled = False
 
-        start_rest_thread(logger)
+            worker_function = project_syncer
+            syncer_args = (
+                logger,
+                log_level,
+                uri,
+                opengrok_config_file,
+                num_workers,
+                env,
+                api_timeout,
+            )
+        else:
+            worker_function = indexer_no_projects
+            syncer_args = (logger, uri, opengrok_config_file, extra_indexer_options)
 
+        if sync_enabled:
+            period_seconds = sync_period_mins * 60
+            logger.debug(
+                f"Creating and starting periodic timer (period {period_seconds} seconds)"
+            )
+            global periodic_timer
+            if periodic_timer is None:
+                # Only create periodic timer once in the loop
+                periodic_timer = PeriodicTimer(period_seconds)
+                periodic_timer.start()
+
+                logger.debug("Starting sync thread")
+                sync_thread = threading.Thread(
+                    target=worker_function, name="Sync thread", args=syncer_args, daemon=True
+                )
+                sync_thread.start()
+
+    start_rest_thread(logger)
+    reset_global_variables()
+    update_web_root_page(logger)
     # Start Tomcat last.
     logger.info("Starting Tomcat")
-    tomcat_temp = os.path.join(OPENGROK_DATA_ROOT, "tomcat_temp")
+    tomcat_temp = os.path.join(OPENGROK_BASE_DIR, "tomcat_temp")
     os.makedirs(tomcat_temp, exist_ok=True)
     tomcat_env = dict(os.environ)
     tomcat_env["CATALINA_TMPDIR"] = tomcat_temp
@@ -711,6 +799,36 @@ def main():
         logger.info("Terminating Tomcat {}".format(tomcat_popen))
         tomcat_popen.terminate()
 
+# Multi-project support, update web root page to navigate to each project
+def update_web_root_page(logger):
+    logger.info("Updating web root page")
+    project_names = []
+    for item in os.listdir(OPENGROK_PROJECTS_DIR):
+        # Check if the item is a file
+        if os.path.isfile(os.path.join(OPENGROK_PROJECTS_DIR, item)):
+            continue
+        project_names.append(item)
+    project_names.sort()
+    # read web_root_template.html and write to web_root.html line by line.
+    # When find keyword "PLACE_HOLDER", replace this keyword with the project name.
+    # The duplicate this line with next project names.
+    template_file = os.path.join(OPENGROK_PROJECTS_DIR, "web_root_template.html")
+    if not os.path.exists(template_file):
+        template_file = "web_root_template.html"
+        return
+    with open(template_file, "r") as fin:
+        web_root = os.path.join(OPENGROK_WEBAPPS_DIR, "ROOT")
+        os.makedirs(web_root, exist_ok=True)
+        with open(web_root + "/index.html", "w") as fout:
+            for line in fin:
+                if "PLACE_HOLDER" in line:
+                    for project_name in project_names:
+                        fout.write(line.replace("PLACE_HOLDER", project_name))
+                else:
+                    fout.write(line)
+    webapp_dirs = os.listdir(OPENGROK_WEBAPPS_DIR)
+    for webapp_dir in webapp_dirs:
+        logger.info("webapp_dir: {}".format(webapp_dir))
 
 if __name__ == "__main__":
     main()
