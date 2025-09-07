@@ -814,8 +814,7 @@ def update_web_root_page(logger):
     # The duplicate this line with next project names.
     template_file = os.path.join(OPENGROK_PROJECTS_DIR, "web_root_template.html")
     if not os.path.exists(template_file):
-        template_file = "web_root_template.html"
-        return
+        template_file = os.path.join(fs_root, "scripts", "web_root_template.html")
     with open(template_file, "r") as fin:
         web_root = os.path.join(OPENGROK_WEBAPPS_DIR, "ROOT")
         os.makedirs(web_root, exist_ok=True)
